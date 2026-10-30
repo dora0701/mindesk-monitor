@@ -80,7 +80,9 @@ jobs:
           commit_state() {
             git config user.name mindesk-monitor
             git config user.email monitor@mindesk.cn
-            git add -A .alert_state .heartbeat 2>/dev/null || true
+            # 不能用 `git add -A .alert_state .heartbeat`：.heartbeat 首次运行时还不存在，
+            # 只要有一个 pathspec 匹配不到，git 会整条命令失败 ⇒ 状态永远提交不上去。
+            git add -A 2>/dev/null || true
             if git diff --cached --quiet; then return 0; fi
             git commit -q -m "$1" || return 0
             git pull --rebase -q --autostash || true
