@@ -1,0 +1,148 @@
+name: 外部可用性拨测
+
+# 为什么需要这个：
+#   服务器上的 backup-watchdog.sh 每小时巡检，但它自己就跑在那台机器上 ——
+#   整机宕机 / 断网 / nginx 挂掉时，巡检脚本跟着一起消失，谁也不会告警。
+#   所以必须有**外部**的检测点。这里用 GitHub Actions 当免费的外部拨测机：
+#   每 5 分钟从境外访问 https://mindesk.cn/api/health，失败就发企业微信。
+#
+# 为什么不用腾讯云云监控：轻量应用服务器只支持 CPU/内存/带宽/磁盘这类
+#   性能消耗指标告警，**没有「实例失联」这一项**；云拨测只有 15 天试用，
+#   之后要开专家版按量付费。
+#
+# 为什么是公开仓库：私有仓库的 Actions 每月只有 2000 分钟免费额度，
+#   5 分钟一次 = 每月 8640 分钟，远超；公开仓库的 Actions 分钟数不限。
+#   本仓库**不含任何密钥或业务代码**，webhook 存在仓库 Secrets 里。
+
+on:
+  schedule:
+    # 每 5 分钟（GitHub 最小粒度；高峰期实际可能延迟几分钟）
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_fail:
+        description: '强制失败，用来测试告警通道'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 健康检查（3 次重试）
+        id: check
+        run: |
+          URL="https://mindesk.cn/api/health"
+          ok=0
+          code=000
+          for i in 1 2 3; do
+            code=$(curl -s -o /tmp/h.json -w '%{http_code}' --max-time 15 "$URL" || echo 000)
+            echo "第 $i 次：HTTP $code"
+            if [ "$code" = "200" ] && grep -q '"success":true' /tmp/h.json 2>/dev/null; then
+              ok=1
+              break
+            fi
+            [ "$i" -lt 3 ] && sleep 10
+          done
+          if [ "${{ inputs.force_fail }}" = "true" ]; then
+            ok=0
+            code="FORCED"
+            echo "（手动触发：强制失败，仅用于测试告警通道）"
+          fi
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+      - name: 告警 / 恢复通知
+        env:
+          WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          OK: ${{ steps.check.outputs.ok }}
+          CODE: ${{ steps.check.outputs.code }}
+        run: |
+          set -uo pipefail
+          STATE=.state/last_alert
+          NOW=$(date +%s)
+          STAMP=$(TZ=Asia/Shanghai date '+%F %T')
+          mkdir -p .state
+
+          send() {
+            python3 - "$1" <<'PY' > /tmp/payload.json
+          import json, sys
+          print(json.dumps({"msgtype": "text", "text": {"content": sys.argv[1]}}, ensure_ascii=False))
+          PY
+            curl -s -m 15 -H 'Content-Type: application/json' \
+              --data-binary @/tmp/payload.json "$WEBHOOK" || echo "webhook 推送失败"
+          }
+
+          commit() {
+            git config user.name  "mindesk-monitor"
+            git config user.email "monitor@mindesk.cn"
+            git add -A .state .heartbeat 2>/dev/null || true
+            git diff --cached --quiet && return 0
+            git commit -q -m "$1" || return 0
+            git pull --rebase -q --autostash || true
+            git push -q || echo "状态提交失败（不影响告警）"
+          }
+
+          if [ "$OK" = "1" ]; then
+            if [ -s "$STATE" ]; then
+              send "【已恢复】[外部拨测] mindesk.cn 已恢复
+          时间: ${STAMP}（北京时间）
+          健康检查: HTTP ${CODE}
+          说明: 之前告警的不可用已结束。"
+              rm -f "$STATE"
+              commit "state: 已恢复 $(TZ=Asia/Shanghai date +%F\ %H:%M)"
+            else
+              echo "正常，无需通知"
+            fi
+            exit 0
+          fi
+
+          # 失败：30 分钟内已经告过警就不再重复，避免每 5 分钟刷屏
+          if [ -s "$STATE" ]; then
+            LAST=$(cat "$STATE" 2>/dev/null || echo 0)
+            if [ $(( NOW - LAST )) -lt 1800 ]; then
+              echo "30 分钟内已告警，跳过（上次 $(TZ=Asia/Shanghai date -d @${LAST} '+%F %T')）"
+              exit 0
+            fi
+          fi
+
+          send "【紧急】mindesk.cn 外部访问不通
+          时间: ${STAMP}（北京时间）
+          健康检查: https://mindesk.cn/api/health → HTTP ${CODE}（3 次重试均失败）
+          影响: 小程序 / 网页后台此刻应该都打不开
+
+          这条是 **GitHub 外部拨测**发的 —— 服务器上的巡检脚本也在这台机器上，
+          整机宕机 / 断网时它不会告警，只能靠这条。
+          👉 请联系 WorkBuddy 处理，无需自行操作。"
+
+          printf '%s' "$NOW" > "$STATE"
+          commit "state: 告警 $(TZ=Asia/Shanghai date +%F\ %H:%M)"
+
+      - name: 保活（防止 GitHub 60 天无活动自动停掉定时任务）
+        run: |
+          set -uo pipefail
+          NEED=0
+          if [ ! -f .heartbeat ]; then NEED=1
+          elif [ $(( $(date +%s) - $(stat -c %Y .heartbeat) )) -gt 604800 ]; then NEED=1
+          fi
+          if [ "$NEED" = "1" ]; then
+            TZ=Asia/Shanghai date -Is > .heartbeat
+            git config user.name  "mindesk-monitor"
+            git config user.email "monitor@mindesk.cn"
+            git add .heartbeat
+            git commit -q -m "chore: 保活 $(TZ=Asia/Shanghai date +%F)"
+            git pull --rebase -q --autostash || true
+            git push -q || echo "保活提交失败"
+          else
+            echo "保活文件还新鲜，跳过"
+          fi
