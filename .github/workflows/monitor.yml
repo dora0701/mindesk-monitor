@@ -68,10 +68,9 @@ jobs:
           CODE: ${{ steps.check.outputs.code }}
         run: |
           set -uo pipefail
-          STATE=.state/last_alert
+          STATE=.alert_state
           NOW=$(date +%s)
           STAMP=$(TZ=Asia/Shanghai date '+%F %T')
-          mkdir -p .state
 
           send() {
             python3 -c 'import json,sys;print(json.dumps({"msgtype":"text","text":{"content":sys.argv[1]}},ensure_ascii=False))' "$1" > /tmp/payload.json
@@ -81,7 +80,7 @@ jobs:
           commit_state() {
             git config user.name mindesk-monitor
             git config user.email monitor@mindesk.cn
-            git add -A .state .heartbeat 2>/dev/null || true
+            git add -A .alert_state .heartbeat 2>/dev/null || true
             if git diff --cached --quiet; then return 0; fi
             git commit -q -m "$1" || return 0
             git pull --rebase -q --autostash || true
